@@ -215,6 +215,86 @@ class MappedUniformDistribution:
         if self.dist.use_cupy and not self.dist.return_gpu:
             return out.get()
         return out
+    
+def spline_prior(pdf_spline, inv_cdf_spline, min, max):
+    """Generate a spline prior distribution class object.
+    Args:
+        x (double np.ndarray): Input parameters to get prior values.
+        pdf_spline (scipy.interpolate.UnivariateSpline): A spline representing the probability density function of the prior.
+        inv_cdf_spline (scipy.interpolate.UnivariateSpline): A spline representing the inverse-cumulative density function of the prior.
+        min (double): Minimum value for the prior.
+        max (double): Maximum value for the prior.
+    Returns:
+        dist (GeneralisedSplinePrior): A generalised prior that is defined in terms of a PDF and inverse CDF spline. 
+    """
+    dist = GeneralisedSplinePrior(pdf_spline, inv_cdf_spline, min, max)
+
+    return dist
+
+
+class GeneralisedSplinePrior(object):
+    """
+    A general prior, expressed in the form of two splines: 
+        - A probability density spline. 
+        - A inverse-cumulative density spline.
+    Will use inverse-transform sampling to generate random samples from the prior, and evaluate the logpdf of the prior at any point in parameter space.
+    
+    The probability density spline is used to evaluate the logpdf of the prior at any point in parameter space, while the inverse-cumulative density spline is used to generate random samples from the prior.
+    Args: 
+        pdf_spline (scipy.interpolate.UnivariateSpline): A spline representing the probability density function of the prior. 
+        cdf_spline (scipy.interpolate.UnivariateSpline): A spline representing the inverse-cumulative density function of the prior.
+    
+    """
+
+    def __init__(self, pdf_spline, cdf_spline, min, max):
+
+        self.pdf_spline = pdf_spline
+        self.inv_cdf_spline = cdf_spline
+        self.min = min
+        self.max = max
+
+
+    @property
+    def xp(self):
+        """Numpy or Cupy,
+        Hardcoded to Numpy for now"""
+        xp = np 
+        return xp 
+
+    def rvs(self, size=1):
+        if not isinstance(size, int) and not isinstance(size, tuple):
+            raise ValueError("size must be an integer or tuple of ints.")
+
+        if isinstance(size, int):
+            size = (size,)
+
+        rand_unif = self.xp.random.rand(*size)
+
+        out = self.inv_cdf_spline(rand_unif)
+
+        # A cubic inverse-CDF spline can overshoot its end nodes (worst near a
+        # steep PDF edge), returning samples just outside [min, max]. Those would
+        # then get -inf from logpdf. Clamp back onto the support.
+        out = self.xp.clip(out, self.min, self.max)
+
+        return out
+
+    def pdf(self, x):
+        out = self.pdf_spline(x)
+
+        return out
+
+    def logpdf(self, x):
+
+        out = self.xp.zeros_like(x)
+        out[(x >= self.min) & (x <= self.max)] = np.log(self.pdf_spline(x[(x >= self.min) & (x <= self.max)]))
+        out[(x < self.min) | (x > self.max)] = -np.inf
+
+        return out
+
+    def copy(self):
+        return deepcopy(self)
+
 
 
 class ProbDistContainer:
