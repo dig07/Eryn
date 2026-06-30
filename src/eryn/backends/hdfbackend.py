@@ -13,7 +13,6 @@ import numpy as np
 from .. import __version__
 from .backend import Backend
 
-
 try:
     import h5py
 except ImportError:
@@ -141,10 +140,22 @@ class HDFBackend(Backend):
                 
             except (BlockingIOError, OSError) as e:
                 try_num += 1
-                if try_num >= max_tries:
-                    raise BlockingIOError("Max tries exceeded trying to open h5 file.")
-                print("Failed to open h5 file. Trying again.")
-                time.sleep(0.2)
+                # Only retry on a true lock contention; bail on file-not-found,
+                # bad-mode, etc. so we surface the real error instead of looping
+                # for ~16 min and swallowing it.
+                msg = str(e)
+                lock_like = isinstance(e, BlockingIOError) or (
+                    "unable to lock" in msg.lower()
+                    or "resource temporarily unavailable" in msg.lower()
+                )
+                if not lock_like or try_num >= max_tries:
+                    raise
+                print(
+                    f"h5 open(mode={mode!r}) lock contention (try {try_num}/{max_tries}): "
+                    f"{type(e).__name__}: {e}",
+                    flush=True,
+                )
+                time.sleep(1.0)
 
         # get the data type and store it if it is not previously set
         if not self.dtype_set and self.name in f:
@@ -223,7 +234,7 @@ class HDFBackend(Backend):
                     raise ValueError("branch_names must be string or list of strings.")
 
             else:
-                branch_names = ["model_{}".format(i) for i in range(nbranches)]
+                branch_names = [f"model_{i}" for i in range(nbranches)]
 
             nbranches = len(branch_names)
 
@@ -403,7 +414,7 @@ class HDFBackend(Backend):
     def key_order(self):
         """Key order of parameters for each model."""
         with self.open() as f:
-            return {key: value for key, value in f[self.name]["key_order"].attrs.items()}
+            return {key: list(value) for key, value in f[self.name]["key_order"].attrs.items()}
 
     @property
     def nwalkers(self):
@@ -790,7 +801,7 @@ class HDFBackend(Backend):
                         g["rj_accepted"][:] += rj_accepted
 
                     for i, v in enumerate(state.random_state):
-                        g.attrs["random_state_{0}".format(i)] = v
+                        g.attrs[f"random_state_{i}"] = v
 
                     g.attrs["iteration"] = iteration + 1
 
@@ -811,10 +822,22 @@ class HDFBackend(Backend):
                 
             except (BlockingIOError, OSError) as e:
                 try_num += 1
-                if try_num >= max_tries:
-                    raise BlockingIOError("Max tries exceeded trying to open h5 file.")
-                print("Failed to open h5 file. Trying again.")
-                time.sleep(10.0)
+                # Only retry on a true lock contention; bail on file-not-found,
+                # bad-mode, etc. so we surface the real error instead of looping
+                # for ~16 min and swallowing it.
+                msg = str(e)
+                lock_like = isinstance(e, BlockingIOError) or (
+                    "unable to lock" in msg.lower()
+                    or "resource temporarily unavailable" in msg.lower()
+                )
+                if not lock_like or try_num >= max_tries:
+                    raise
+                print(
+                    f"h5 open(mode={mode!r}) lock contention (try {try_num}/{max_tries}): "
+                    f"{type(e).__name__}: {e}",
+                    flush=True,
+                )
+                time.sleep(1.0)
 
 
 class TempHDFBackend(object):
