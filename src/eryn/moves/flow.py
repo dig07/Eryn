@@ -11,6 +11,7 @@ This module is intentionally torch-free at import time: ``eryn.flows.base``
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -21,10 +22,10 @@ if TYPE_CHECKING:
     # Only for static type-checkers; never executed at runtime.
     from eryn.flows.base import Flow, FlowProposalDistribution  # noqa: F401
 
-__all__ = ["FlowMove"]
+__all__ = ["ConditionalFlowMove"]
+logger = logging.getLogger(__name__)
 
-
-class FlowMove(MHMove):
+class ConditionalFlowMove(MHMove):
     """Independent-Metropolis proposal drawing from a conditional normalizing flow.
 
     Proposes new coordinates for a single named branch by sampling from a
@@ -66,6 +67,24 @@ class FlowMove(MHMove):
     than a crash; graceful degradation is a future scheduler policy, not the
     move's job.
 
+    **Temperature-scaled proposals (optional, via** :attr:`active_betas` **)**
+
+    The flow is trained on cold-chain (``beta=1``) samples only, but this move
+    proposes for walker rows at every temperature.  A hot row's target is
+    ``propto L(theta)**beta * pi(theta)`` — roughly the cold posterior broadened
+    by ``1/sqrt(beta)`` — so without correction, hot rows are proposed from deep
+    in the cold flow's tails and are almost always rejected.  Setting
+    :attr:`active_betas` (typically done by the outer move on every repeat for
+    the current leaf) fixes this: :meth:`get_proposal` groups rows by temperature
+    and re-proposes each group from the SAME trained flow but with its base
+    distribution scaled by ``s = beta_t**-0.5`` using the ``base_scale`` keyword
+    argument — an exact affine reparameterisation of the base, so the Hastings
+    bookkeeping stays exact.  This requires a flow whose ``sample_and_log_prob``
+    and ``log_prob`` methods accept the optional ``base_scale`` keyword (e.g.
+    :class:`eryn.flows.ZukoFlow`); flows without this keyword will raise
+    :exc:`TypeError`.  ``active_betas=None`` (the default) reproduces the
+    original unscaled behaviour exactly.
+
     Parameters
     ----------
     flow : eryn.flows.Flow
@@ -82,7 +101,8 @@ class FlowMove(MHMove):
         — zero overhead, no executor interaction.
     harvest_every : int, optional
         Submit cold-chain coordinates to the executor on every
-        ``harvest_every``-th :meth:`setup` call.  Default is ``1`` (every call).
+        ``harvest_every``-th :meth:`setup` call.  Default is ``1`` (every call). If ``None``, harvesting is disabled. 
+
         Polling for new weights happens on every call regardless of this value.
     harvest_temp_index : int, optional
         Temperature index to harvest from.  Default is ``0`` (the cold chain).
@@ -96,19 +116,34 @@ class FlowMove(MHMove):
     active_condition : int
         Condition id passed to the flow on every ``get_proposal`` call.
         Readable and writable; the setter coerces the value to ``int``.
+    active_betas : np.ndarray or None
+        Per-temperature inverse-temperature ladder, shape ``(ntemps,)``,
+        matching the leading axis of the branch coords seen by
+        :meth:`get_proposal`.  ``None`` (the default) reproduces today's
+        behaviour exactly: every row is proposed from the flow's native
+        (unscaled) base.  When set (typically by the outer move, re-assigned on
+        every repeat for the current leaf, to that leaf's current temperature
+        ladder), :meth:`get_proposal` groups rows by temperature ``t`` and
+        proposes each group with ``base_scale = active_betas[t] ** -0.5`` via
+        the ``base_scale`` keyword argument — broadening the flow's base for hot
+        chains so they are no longer proposed from deep in the cold flow's tails
+        (see the module/class docstring for the statistical motivation).  This
+        requires a flow whose ``sample_and_log_prob`` and ``log_prob`` methods
+        accept the optional ``base_scale`` keyword; flows without it will raise
+        :exc:`TypeError`.  Plain attribute, not a property: set it directly.
     loaded_version : int
         Version of the most recently hot-loaded weights (``0`` if none have been
         loaded).  Read-only.
 
     Examples
     --------
-    >>> move = FlowMove(my_flow, branch_name="x")
+    >>> move = ConditionalFlowMove(my_flow, branch_name="x")
     >>> move.active_condition = 2   # switch to condition 2 before sampling
 
     >>> # With online training:
     >>> from eryn.flows import InlineExecutor
     >>> ex = InlineExecutor(my_flow, min_train_samples=1000)
-    >>> move = FlowMove(my_flow, branch_name="x", executor=ex, harvest_every=10)
+    >>> move = ConditionalFlowMove(my_flow, branch_name="x", executor=ex, harvest_every=10)
     """
 
     def __init__(
@@ -124,7 +159,12 @@ class FlowMove(MHMove):
         self.flow = flow
         self.branch_name = branch_name
         self._active_condition: int = 0
-        self.harvest_every = int(harvest_every)
+        # Per-temperature beta ladder for this move's branch, shape (ntemps,).
+        # None (default): get_proposal is unscaled, exactly as before this
+        # attribute existed.  Set externally, per leaf, by the outer move
+        # (e.g. ResidualAddOneRemoveOneMove) — see the class docstring.
+        self.active_betas = None
+        self.harvest_every = int(harvest_every) if harvest_every is not None else None
         self.harvest_temp_index = int(harvest_temp_index)
         self._setup_calls = 0
         self._loaded_version = 0
@@ -232,11 +272,8 @@ class FlowMove(MHMove):
         self._setup_calls += 1
 
         # --- harvest (non-blocking submit) ---
-        if self._setup_calls % self.harvest_every == 0:
-            coords = branches_coords[self.branch_name][self.harvest_temp_index]
-            ndim = coords.shape[-1]
-            flat = np.asarray(coords).reshape(-1, ndim)
-            self.executor.submit({self.active_condition: flat})
+        if self.harvest_every is not None and self._setup_calls % self.harvest_every == 0:
+            self.submit(branches_coords)
 
         # --- poll + hot-reload (non-blocking; TrainerError propagates) ---
         lw = self.executor.latest_weights()
@@ -248,7 +285,52 @@ class FlowMove(MHMove):
                 # atomically, so this flow never disagrees with the trainer on
                 # the coords-latent map.
                 self.flow.set_weights(snapshot)
+                logger.debug(
+                    f"{type(self).__name__}: hot-loaded new flow weights version"
+                    f" {version} (previously {self._loaded_version})."
+                )
                 self._loaded_version = version
+            else:
+                logger.debug(
+                    f"{type(self).__name__}: no new flow weights (latest version"
+                    f" {version}, previously loaded {self._loaded_version})."
+                )
+        else:
+            logger.debug(
+                f"{type(self).__name__}: executor has no trained weights yet"
+                f" (previously loaded {self._loaded_version})."
+            )
+
+    def submit(self, branches_coords: dict):
+        """
+        Submit the cold-chain coordinates of this move's branch to the executor for training.
+
+        Args:
+            branches_coords (dict): Keys are branch names; values are
+                ``np.ndarray[ntemps, nwalkers, nleaves_max, ndim]`` current
+                coordinates, or ``np.ndarray[nsteps, ntemps, nwalkers, nleaves_max, ndim]`` if the move is called from a multi-step context.
+        """
+        coords = branches_coords[self.branch_name]
+        
+        batch = {
+            leaf: coords[..., self.harvest_temp_index, :, leaf, :].reshape(-1, coords.shape[-1])
+            for leaf in range(coords.shape[-2])
+        }
+
+        self.submit_by_leaf(batch)
+
+    def submit_by_leaf(self, batch: dict):
+        """
+        Submit a batch of coordinates to the executor for training.
+
+        Args:
+            batch (dict): Keys are leaf indices; values are
+                ``np.ndarray[n_samples, ndim]`` coordinates for that leaf.
+        """
+        if self.executor is None:
+            return
+        
+        self.executor.submit(batch)
 
     # ------------------------------------------------------------------
     # MHMove interface
@@ -279,6 +361,18 @@ class FlowMove(MHMove):
         factors : np.ndarray, shape (ntemps, nwalkers)
             Hastings log-factors: ``+log q(x_old) - log q(x_new)`` accumulated
             with :func:`numpy.add.at` over all active leaves of ``branch_name``.
+
+        Notes
+        -----
+        When :attr:`active_betas` is ``None`` (the default), every active row
+        of ``branch_name`` is proposed from the flow's native base in a single
+        ``sample_and_log_prob`` / ``logpdf`` pair — exactly as before this
+        attribute existed.  When :attr:`active_betas` is set, rows are grouped
+        by temperature (the leading axis of ``branches_coords[branch_name]``)
+        and each temperature ``t`` is proposed with
+        ``base_scale = active_betas[t] ** -0.5``, using its own
+        ``sample_and_log_prob`` / ``log_prob`` pair (both draws and both logq
+        terms of that row's Hastings factor use the same scale).
         """
         # Lazy import: FlowProposalDistribution is pure NumPy (no torch), but
         # importing it here guarantees that even if eryn.flows.base were ever
@@ -321,7 +415,7 @@ class FlowMove(MHMove):
             q[name] = coords.copy()
 
             if name != self.branch_name:
-                continue  # FlowMove only proposes for its own branch
+                continue  # ConditionalFlowMove only proposes for its own branch
 
             where = np.where(branches_inds[name])
             old_points = coords[where]
@@ -329,22 +423,54 @@ class FlowMove(MHMove):
             if num == 0:
                 continue
 
-            # + log q(old): np.add.at so multi-leaf duplicate (temp, walker) indices
-            # accumulate instead of last-write-wins on repeated fancy-index +=.
-            # NaN logq values (e.g. from out-of-support old points) propagate into
-            # lnpdiff.  NaN comparisons are always False, so such proposals are
-            # unconditionally rejected — the "no-bias" claim in the class docstring
-            # relies on this IEEE-754 property rather than on an explicit NaN guard.
-            np.add.at(factors, where[:2], dist.logpdf(old_points))
+            if self.active_betas is None:
+                # + log q(old): np.add.at so multi-leaf duplicate (temp, walker) indices
+                # accumulate instead of last-write-wins on repeated fancy-index +=.
+                # NaN logq values (e.g. from out-of-support old points) propagate into
+                # lnpdiff.  NaN comparisons are always False, so such proposals are
+                # unconditionally rejected — the "no-bias" claim in the class docstring
+                # relies on this IEEE-754 property rather than on an explicit NaN guard.
+                np.add.at(factors, where[:2], dist.logpdf(old_points))
 
-            # Draw and - log q(new): sample_and_log_prob avoids a second forward
-            # pass — the log-prob returned during sampling is reused directly.
-            # Same NaN-rejection applies if the flow returns NaN for new points.
-            new_points, logq_new = self.flow.sample_and_log_prob(
-                num, context=self.active_condition
-            )
-            np.add.at(factors, where[:2], -logq_new)
+                # Draw and - log q(new): sample_and_log_prob avoids a second forward
+                # pass — the log-prob returned during sampling is reused directly.
+                # Same NaN-rejection applies if the flow returns NaN for new points.
+                new_points, logq_new = self.flow.sample_and_log_prob(
+                    num, context=self.active_condition
+                )
+                np.add.at(factors, where[:2], -logq_new)
 
-            q[name][where] = new_points
+                q[name][where] = new_points
+            else:
+                # Temperature-scaled proposals: group rows by temperature (the
+                # first axis of `coords`, per the class docstring) and, per
+                # temperature t, propose from the SAME flow with
+                # base_scale = active_betas[t]**-0.5 — one sample call + one
+                # log_prob call per temperature (ntemps is small, <= a few).
+                # `mask` sub-selects `where`/`old_points` while preserving row
+                # order, so the final scatter below is identical in shape and
+                # ordering to the active_betas=None path above.
+                temp_of_row = where[0]
+                new_points = np.empty_like(old_points)
+                for t in range(coords.shape[0]):
+                    mask = temp_of_row == t
+                    num_t = int(mask.sum())
+                    if num_t == 0:
+                        continue
+                    s = float(self.active_betas[t]) ** -0.5
+                    idx_t = tuple(w[mask] for w in where[:2])
+
+                    logq_old_t = self.flow.log_prob(
+                        old_points[mask], context=self.active_condition, base_scale=s
+                    )
+                    np.add.at(factors, idx_t, logq_old_t)
+
+                    new_points_t, logq_new_t = self.flow.sample_and_log_prob(
+                        num_t, context=self.active_condition, base_scale=s
+                    )
+                    np.add.at(factors, idx_t, -logq_new_t)
+                    new_points[mask] = new_points_t
+
+                q[name][where] = new_points
 
         return q, factors

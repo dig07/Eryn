@@ -66,8 +66,8 @@ from .conditioning import ConditioningStrategy, OneHotLeafConditioning  # noqa: 
 
 # ---- lazy names — resolved by __getattr__ on first attribute access ----
 # ZukoFlow/WhiteningTransform live in the optional torch subpackage; accessing
-# them without torch raises AttributeError (hasattr-safe), with the install hint
-# chained as cause.
+# them without torch raises AttributeError (hasattr-safe), with the install
+# hint chained as cause.
 _TORCH_NAMES = {"ZukoFlow", "WhiteningTransform"}
 
 # Executor names live in the torch-free eryn.flows.executors module.  They are
